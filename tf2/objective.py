@@ -23,12 +23,25 @@ FLAGS = flags.FLAGS
 
 LARGE_NUM = 1e9
 
-
+""" Classification Problem, SimCLR: Compute mean supervised loss over local batch.
 def add_supervised_loss(labels, logits):
-  """Compute mean supervised loss over local batch."""
+  
   losses = tf.keras.losses.CategoricalCrossentropy(
       from_logits=True, reduction=tf.keras.losses.Reduction.NONE)(labels,
                                                                   logits)
+  return tf.reduce_mean(losses)
+
+ """
+
+# converted to a regression problem for robot grasping
+def add_supervised_loss(labels, predictions):
+  mse = tf.keras.losses.MeanSquaredError(
+      reduction=tf.keras.losses.Reduction.NONE
+  )
+
+  losses = mse(labels, predictions)
+  print("losses in add_supervised_loss (objective): ", losses)
+
   return tf.reduce_mean(losses)
 
 

@@ -1,0 +1,56 @@
+Pre-Training mit Cifar10, ResNet_depth=18
+
+python run.py --train_mode=pretrain --train_batch_size=512 --train_epochs=1000 --learning_rate=1.0 --weight_decay=1e-4 --temperature=0.5 --dataset=cifar10 --image_size=32 --eval_split=test --resnet_depth=18 --use_blur=False --color_jitter_strength=0.5 --model_dir=/data/8bittner/simclr_test2 --use_tpu=False
+
+
+Fine-tune:
+
+python run.py \
+  --mode=train_then_eval \
+  --train_mode=finetune \
+  --fine_tune_after_block=-1 \
+  --zero_init_logits_layer=True \
+  --global_bn=False \
+  --optimizer=momentum \
+  --learning_rate=0.1 \
+  --weight_decay=0.0 \
+  --train_epochs=100 \
+  --train_batch_size=512 \
+  --warmup_epochs=0 \
+  --dataset=cifar10 \
+  --image_size=32 \
+  --eval_split=test \
+  --resnet_depth=18 \
+  --checkpoint=/data/8bittner/simclr_test_full/ckpt-97706.index \
+  --model_dir=/data/8bittner/simclr_test_full_lineareval \
+  --use_tpu=False
+
+
+
+Commands VM:
+
+Tmux-sessions:
+
+	- Tmux ls
+	- Create Session: tmux new -s "name"
+	- Verlassen ohne Stoppen: CTRL+B -> D
+	- Reconnect: tmux attach -t "name"
+	- Tmux beenden: exit (in tmux session) oder von außerhalb: tmux kill-session -t "name"
+
+Training:
+	- Tmux session erstellen
+	- Conda activate simCLR2
+	- export CUDA_DEVICE_ORDER=PCI_BUS_ID
+	- export CUDA_VISIBLE_DEVICES=2
+	- Python run.py …"command"
+
+Prüfen ob Training noch läuft:
+Nvidia-smi / ps aux
+
+
+Training-Ergebnisse ansehen:
+	- In model_dir ls -> schauen ob checkpoints existieren
+	- In den output-Ordner gehen
+	- Python -m tensorboard.main --logdir .
+	- Portforwarding von lokalem rechner: ssh -L 6006:localhost:6006 username@server
+	- Dann im Browser: http://localhost:6006

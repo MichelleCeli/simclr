@@ -46,20 +46,37 @@ def update_pretrain_metrics_eval(contrast_loss_metric,
   contrastive_top_5_accuracy_metric.update_state(labels_con, logits_con)
 
 
+# For now, classification metric just exchanged with regression metric
 def update_finetune_metrics_train(supervised_loss_metric, supervised_acc_metric,
                                   loss, labels, logits):
   supervised_loss_metric.update_state(loss)
 
-  label_acc = tf.equal(tf.argmax(labels, 1), tf.argmax(logits, axis=1))
-  label_acc = tf.reduce_mean(tf.cast(label_acc, tf.float32))
-  supervised_acc_metric.update_state(label_acc)
+  mae = tf.reduce_mean(
+    tf.abs(labels - logits)
+  )
+
+  """  label_acc = tf.equal(tf.argmax(labels, 1), tf.argmax(logits, axis=1))
+  label_acc = tf.reduce_mean(tf.cast(label_acc, tf.float32)) """
+
+  supervised_acc_metric.update_state(mae)
 
 
+# For now, classification metrics just exchanged with regression metrics
 def update_finetune_metrics_eval(label_top_1_accuracy_metrics,
                                  label_top_5_accuracy_metrics, outputs, labels):
-  label_top_1_accuracy_metrics.update_state(
+  """ label_top_1_accuracy_metrics.update_state(
       tf.argmax(labels, 1), tf.argmax(outputs, axis=1))
-  label_top_5_accuracy_metrics.update_state(labels, outputs)
+  label_top_5_accuracy_metrics.update_state(labels, outputs) """
+
+  mae = tf.reduce_mean(
+        tf.abs(labels - outputs)
+    )
+  mse = tf.reduce_mean(
+        tf.square(labels - outputs)
+    )
+  
+  label_top_1_accuracy_metrics.update_state(mae)
+  label_top_5_accuracy_metrics.update_state(mse)
 
 
 def _float_metric_value(metric):

@@ -22,12 +22,14 @@ import os
 from absl import app
 from absl import flags
 from absl import logging
-import data as data_lib
+import custom_data as data_lib
+import dataset_loader as data_loader
 import metrics
 import model as model_lib
 import objective as obj_lib
 import tensorflow.compat.v2 as tf
 import tensorflow_datasets as tfds
+
 
 
 
@@ -237,6 +239,10 @@ flags.DEFINE_boolean(
     'use_blur', True,
     'Whether or not to use Gaussian blur for augmentation during pretraining.')
 
+flags.DEFINE_string(
+    'csv_path', None,
+    'Path to label from csv_file')
+
 
 def get_salient_tensors_dict(include_projection_head):
   """Returns a dictionary of tensors."""
@@ -326,6 +332,10 @@ def try_restore_from_checkpoint(model, global_step, optimizer):
         directory=FLAGS.model_dir,
         max_to_keep=FLAGS.keep_checkpoint_max)
     checkpoint_manager2.checkpoint.restore(FLAGS.checkpoint).expect_partial()
+
+    for v in model.trainable_variables:
+        print(v.name, v.shape)
+
     if FLAGS.zero_init_logits_layer:
       model = checkpoint_manager2.checkpoint.model
       output_layer_parameters = model.supervised_head.trainable_weights
@@ -333,6 +343,8 @@ def try_restore_from_checkpoint(model, global_step, optimizer):
                    [x.op.name for x in output_layer_parameters])
       for x in output_layer_parameters:
         x.assign(tf.zeros_like(x))
+  
+
 
   return checkpoint_manager
 
@@ -464,15 +476,35 @@ def _restore_latest_or_from_pretrain(checkpoint_manager):
 
 
 def main(argv):
+  print("START MAIN")
+  print("MODEL DIR:", FLAGS.model_dir)
+  print("MODEL DIR:", FLAGS.data_dir)
+  print("FLAGS.checkpoint =", FLAGS.checkpoint)
+  print("FLAGS.train_mode =", FLAGS.train_mode)
+
   if len(argv) > 1:
     raise app.UsageError('Too many command-line arguments.')
 
-
+  # SimCLR
+  '''
   builder = tfds.builder(FLAGS.dataset, data_dir=FLAGS.data_dir)
   builder.download_and_prepare()
   num_train_examples = builder.info.splits[FLAGS.train_split].num_examples
   num_eval_examples = builder.info.splits[FLAGS.eval_split].num_examples
   num_classes = builder.info.features['label'].num_classes
+  '''
+
+  
+  num_train_examples = data_loader.get_dataset_size(FLAGS.csv_path)
+  # no builder needed here anymore, now done later during input pipeline in custom_data.py (/dataset_loader)
+  """  image_paths = tf.io.gfile.glob(
+    FLAGS.data_dir + '/*.png'
+  ) """
+  
+  print("length image paths: ", num_train_examples)
+  num_classes = 6
+  num_eval_examples = 0
+
 
   train_steps = model_lib.get_train_steps(num_train_examples)
   eval_steps = FLAGS.eval_steps or int(
@@ -511,6 +543,8 @@ def main(argv):
     model = model_lib.Model(num_classes)
 
   if FLAGS.mode == 'eval':
+    raise NotImplementedError("Custom eval pipeline not implemented yet.")
+    '''
     for ckpt in tf.train.checkpoints_iterator(
         FLAGS.model_dir, min_interval_secs=15):
       result = perform_evaluation(model, builder, eval_steps, ckpt, strategy,
@@ -518,12 +552,28 @@ def main(argv):
       if result['global_step'] >= train_steps:
         logging.info('Eval complete. Exiting...')
         return
+    '''
   else:
     summary_writer = tf.summary.create_file_writer(FLAGS.model_dir)
+
     with strategy.scope():
       # Build input pipeline.
-      ds = data_lib.build_distributed_dataset(builder, FLAGS.train_batch_size,
-                                              True, strategy, topology)
+
+      ds = data_lib.build_distributed_dataset(
+        FLAGS.data_dir, 
+        FLAGS.train_batch_size,
+        True, 
+        strategy, 
+        topology)
+      
+      '''
+      ds = data_lib.build_distributed_dataset(
+        builder, 
+        FLAGS.train_batch_size,
+        True, 
+        strategy, 
+        topology)
+      '''
 
       # Build LR schedule and optimizer.
       learning_rate = model_lib.WarmUpAndCosineDecay(FLAGS.learning_rate,
@@ -548,6 +598,13 @@ def main(argv):
         supervised_acc_metric = tf.keras.metrics.Mean('train/supervised_acc')
         all_metrics.extend([supervised_loss_metric, supervised_acc_metric])
 
+      dummy = tf.zeros([1, FLAGS.image_size, FLAGS.image_size, 3])
+      model(dummy, training=False)
+
+      print("MODEL BUILT")
+      for v in model.trainable_variables:
+          print(v.name, v.shape)
+
       # Restore checkpoint if available.
       checkpoint_manager = try_restore_from_checkpoint(
           model, optimizer.iterations, optimizer)
@@ -555,6 +612,7 @@ def main(argv):
     steps_per_loop = checkpoint_steps
 
     def single_step(features, labels):
+      tf.print("BEGIN SINGLE STEP")
       with tf.GradientTape() as tape:
         # Log summaries on the last step of the training loop to match
         # logging frequency of other scalar summaries.
@@ -574,9 +632,11 @@ def main(argv):
           # Only log augmented images for the first tower.
           tf.summary.image(
               'image', features[:, :, :, :3], step=optimizer.iterations + 1)
+        
         projection_head_outputs, supervised_head_outputs = model(
             features, training=True)
         loss = None
+        tf.print("After Model")
         if projection_head_outputs is not None:
           outputs = projection_head_outputs
           con_loss, logits_con, labels_con = obj_lib.add_contrastive_loss(
@@ -593,12 +653,16 @@ def main(argv):
                                                 contrast_entropy_metric,
                                                 con_loss, logits_con,
                                                 labels_con)
-        if supervised_head_outputs is not None:
+        # and FLAGS.train_mode != 'pretrain' added to do first pre-train with custom images without labels
+        if supervised_head_outputs is not None and FLAGS.train_mode != 'pretrain':
+          tf.print("supervised head outputs bedingung")
           outputs = supervised_head_outputs
           l = labels['labels']
           if FLAGS.train_mode == 'pretrain' and FLAGS.lineareval_while_pretraining:
             l = tf.concat([l, l], 0)
-          sup_loss = obj_lib.add_supervised_loss(labels=l, logits=outputs)
+          tf.print("labels:", labels['labels'][0])
+          tf.print("outputs:", outputs[0])
+          sup_loss = obj_lib.add_supervised_loss(labels=l, predictions=outputs)
           if loss is None:
             loss = sup_loss
           else:
@@ -619,6 +683,14 @@ def main(argv):
         for var in model.trainable_variables:
           logging.info(var.name)
         grads = tape.gradient(loss, model.trainable_variables)
+        for grad, var in zip(grads, model.trainable_variables):
+          if grad is not None:
+              tf.print(
+                  "VAR:",
+                  var.name,
+                  "var_shape=", tf.shape(var),
+                  "grad_shape=", tf.shape(grad)
+              )
         optimizer.apply_gradients(zip(grads, model.trainable_variables))
 
     with strategy.scope():
@@ -632,6 +704,8 @@ def main(argv):
           # gets prefixed to every variable name. This does not affect training
           # but does affect the checkpoint conversion script.
           # TODO(b/161712658): Remove this.
+
+          tf.print("train_multiple_steps in range")
           with tf.name_scope(''):
             images, labels = next(iterator)
             features, labels = images, {'labels': labels}
@@ -640,6 +714,7 @@ def main(argv):
       global_step = optimizer.iterations
       cur_step = global_step.numpy()
       iterator = iter(ds)
+      print("START TRAIN LOOP")
       while cur_step < train_steps:
         # Calls to tf.summary.xyz lookup the summary writer resource which is
         # set by the summary writer's context manager.
