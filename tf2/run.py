@@ -340,7 +340,7 @@ def try_restore_from_checkpoint(model, global_step, optimizer):
       model = checkpoint_manager2.checkpoint.model
       output_layer_parameters = model.supervised_head.trainable_weights
       logging.info('Initializing output layer parameters %s to zero',
-                   [x.op.name for x in output_layer_parameters])
+                   [x.name for x in output_layer_parameters])
       for x in output_layer_parameters:
         x.assign(tf.zeros_like(x))
   
@@ -470,7 +470,7 @@ def _restore_latest_or_from_pretrain(checkpoint_manager):
       model = checkpoint_manager.checkpoint.model
       output_layer_parameters = model.supervised_head.trainable_weights
       logging.info('Initializing output layer parameters %s to zero',
-                   [x.op.name for x in output_layer_parameters])
+                   [x.name for x in output_layer_parameters])
       for x in output_layer_parameters:
         x.assign(tf.zeros_like(x))
 
