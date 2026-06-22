@@ -27,7 +27,8 @@ from dataset_loader import create_dataset
 FLAGS = flags.FLAGS
 
 
-def build_input_fn(data_dir, global_batch_size, topology, is_training):
+def build_input_fn(data_dir, global_batch_size, topology, is_training,
+                   csv_path=None):
   """Build input function.
 
   Args:
@@ -35,6 +36,12 @@ def build_input_fn(data_dir, global_batch_size, topology, is_training):
     global_batch_size: Global batch size.
     topology: An instance of `tf.tpu.experimental.Topology` or None.
     is_training: Whether to build in training mode.
+    csv_path: Eigene Änderung. Optionaler expliziter Pfad zur Label-CSV.
+      Falls None (Standard), wird wie bisher FLAGS.csv_path verwendet -> das
+      Trainingsverhalten ändert sich dadurch nicht. Wird gebraucht, damit die
+      Evaluation eine ANDERE CSV (FLAGS.test_csv_path) laden kann als das
+      Training, ohne dass beide sich eine globale FLAGS.csv_path teilen
+      müssen.
 
   Returns:
     A function that accepts a dict of params and returns a tuple of images and
@@ -95,7 +102,12 @@ def build_input_fn(data_dir, global_batch_size, topology, is_training):
       dataset = dataset.cache()
     '''
 
-    dataset = create_dataset(data_dir=data_dir, image_size=FLAGS.image_size, csv_path=FLAGS.csv_path)
+    # Eigene Änderung: csv_path kommt jetzt primär aus dem Funktionsparameter,
+    # Fallback auf FLAGS.csv_path nur wenn keiner übergeben wurde (siehe
+    # Docstring oben). Vorher stand hier direkt FLAGS.csv_path, wodurch
+    # Training und Evaluation zwangsläufig dieselbe CSV benutzt hätten.
+    resolved_csv_path = csv_path if csv_path is not None else FLAGS.csv_path
+    dataset = create_dataset(data_dir=data_dir, image_size=FLAGS.image_size, csv_path=resolved_csv_path)
 
     if is_training:
       options = tf.data.Options()
@@ -115,20 +127,24 @@ def build_input_fn(data_dir, global_batch_size, topology, is_training):
 
 
 def build_distributed_dataset(data_dir, batch_size, is_training, strategy,
-                              topology):
-  
-    # SimCLR 
+                              topology, csv_path=None):
+
+    # SimCLR
     '''
     input_fn = build_input_fn(builder, batch_size, topology, is_training)
     '''
 
+    # Eigene Änderung: csv_path wird optional durchgereicht (siehe
+    # build_input_fn oben). Default None -> Verhalten für bestehende
+    # Aufrufer (Training) bleibt unverändert (FLAGS.csv_path).
     input_fn = build_input_fn(
         data_dir,
         batch_size,
         topology,
-        is_training
+        is_training,
+        csv_path
     )
-  
+
     return strategy.distribute_datasets_from_function(input_fn)
 
 

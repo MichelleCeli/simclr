@@ -243,6 +243,14 @@ flags.DEFINE_string(
     'csv_path', None,
     'Path to label from csv_file')
 
+# Eigene Änderung: separater Flag für ein Held-out-Test-CSV, damit Training
+# (csv_path) und Evaluation (test_csv_path) nicht dieselbe Datei teilen
+# müssen. Wird von --mode=eval und --mode=train_then_eval benötigt.
+flags.DEFINE_string(
+    'test_csv_path', None,
+    'Path to a separate, held-out CSV used for --mode=eval and '
+    '--mode=train_then_eval. Same column format as csv_path.')
+
 
 def get_salient_tensors_dict(include_projection_head):
   """Returns a dictionary of tensors."""
@@ -333,8 +341,10 @@ def try_restore_from_checkpoint(model, global_step, optimizer):
         max_to_keep=FLAGS.keep_checkpoint_max)
     checkpoint_manager2.checkpoint.restore(FLAGS.checkpoint).expect_partial()
 
+    # Eigene Änderung: print() -> logging.info() (Buffering, siehe Kommentar
+    # in main()).
     for v in model.trainable_variables:
-        print(v.name, v.shape)
+        logging.info('%s %s', v.name, v.shape)
 
     if FLAGS.zero_init_logits_layer:
       model = checkpoint_manager2.checkpoint.model
@@ -357,6 +367,14 @@ def json_serializable(val):
     return False
 
 
+# ==============================================================================
+# ORIGINAL SimCLR perform_evaluation (TFDS-Checkpoint-Polling,
+# Klassifikations-Metriken: Accuracy/TopK, erwartet einen TFDS-"builder"
+# statt unserem data_dir+csv_path-Loader). Wird in diesem Projekt nicht mehr
+# benutzt -> auskommentiert und durch die Regressions-Variante darunter
+# ersetzt.
+# ==============================================================================
+'''
 def perform_evaluation(model, builder, eval_steps, ckpt, strategy, topology):
   """Perform evaluation."""
   if FLAGS.train_mode == 'pretrain' and not FLAGS.lineareval_while_pretraining:
@@ -442,6 +460,86 @@ def perform_evaluation(model, builder, eval_steps, ckpt, strategy, topology):
   save(model, global_step=result['global_step'])
 
   return result
+'''
+
+
+# ==============================================================================
+# Eigene Änderung: Regressions-Evaluation auf einem separaten Held-out-CSV
+# (FLAGS.test_csv_path).
+#
+# Unterschiede zur auskommentierten Original-Version:
+#  - kein TFDS-"builder" mehr, sondern data_lib.build_distributed_dataset mit
+#    FLAGS.data_dir + FLAGS.test_csv_path (nutzt unseren custom_data.py /
+#    dataset_loader.py Pfad).
+#  - keine eigene Checkpoint-Restore-Logik mehr in dieser Funktion: das Modell
+#    wird VOR dem Aufruf bereits gebaut und (falls --mode=eval) per
+#    try_restore_from_checkpoint() geladen, siehe main(). Bei
+#    --mode=train_then_eval steckt im model bereits der gerade trainierte
+#    Stand -> kein erneutes Laden nötig.
+#  - Metriken sind MAE/MSE statt Accuracy/TopK, weil die 6 Zielgrößen
+#    Gelenkwinkel (Regression) sind, keine Klassen.
+#  - läuft genau einmal komplett über den Testdatensatz (keine
+#    Endlos-Polling-Schleife wie im Original), passend für "ein Checkpoint,
+#    einmal auswerten".
+# ==============================================================================
+def perform_evaluation(model, strategy, topology):
+  """Eigene Regressions-Evaluation auf FLAGS.test_csv_path.
+
+  Erwartet, dass `model` bereits gebaut (mind. ein Dummy-Forward-Pass) und
+  mit den gewünschten Gewichten geladen ist, bevor diese Funktion
+  aufgerufen wird.
+  """
+  if not FLAGS.test_csv_path:
+    raise ValueError(
+        '--test_csv_path muss gesetzt sein für --mode=eval bzw. '
+        '--mode=train_then_eval.')
+
+  num_test_examples = data_loader.get_dataset_size(FLAGS.test_csv_path)
+  test_steps = int(math.ceil(num_test_examples / FLAGS.eval_batch_size))
+  logging.info('# test examples: %d', num_test_examples)
+  logging.info('# test steps: %d', test_steps)
+
+  # Build input pipeline. is_training=False -> kein repeat(-1), kein shuffle,
+  # drop_remainder=False -> der gesamte Testdatensatz wird genau einmal
+  # durchlaufen.
+  ds = data_lib.build_distributed_dataset(
+      FLAGS.data_dir, FLAGS.eval_batch_size, False, strategy, topology,
+      csv_path=FLAGS.test_csv_path)
+
+  with strategy.scope():
+    mae_metric = tf.keras.metrics.Mean('test/mae')
+    mse_metric = tf.keras.metrics.Mean('test/mse')
+    all_metrics = [mae_metric, mse_metric]
+
+  def single_step(features, labels):
+    _, outputs = model(features, training=False)
+    assert outputs is not None, (
+        '--train_mode=finetune muss gesetzt sein, damit model(...) den '
+        'supervised head zurückgibt.')
+    mae_metric.update_state(tf.reduce_mean(tf.abs(labels - outputs)))
+    mse_metric.update_state(tf.reduce_mean(tf.square(labels - outputs)))
+
+  with strategy.scope():
+
+    @tf.function
+    def run_single_step(iterator):
+      images, labels = next(iterator)
+      strategy.run(single_step, (images, labels))
+
+    iterator = iter(ds)
+    for i in range(test_steps):
+      run_single_step(iterator)
+      logging.info('Completed test eval for %d / %d steps', i + 1, test_steps)
+    logging.info('Finished test eval on %s', FLAGS.test_csv_path)
+
+  result = {metric.name: float(metric.result().numpy()) for metric in all_metrics}
+  logging.info('Test set result: %s', result)
+
+  result_json_path = os.path.join(FLAGS.model_dir, 'test_result.json')
+  with tf.io.gfile.GFile(result_json_path, 'w') as f:
+    json.dump(result, f)
+
+  return result
 
 
 def _restore_latest_or_from_pretrain(checkpoint_manager):
@@ -476,11 +574,19 @@ def _restore_latest_or_from_pretrain(checkpoint_manager):
 
 
 def main(argv):
-  print("START MAIN")
-  print("MODEL DIR:", FLAGS.model_dir)
-  print("MODEL DIR:", FLAGS.data_dir)
-  print("FLAGS.checkpoint =", FLAGS.checkpoint)
-  print("FLAGS.train_mode =", FLAGS.train_mode)
+  # Eigene Änderung: print() statt logging.info() landet bei Redirect in eine
+  # Datei (> eval.log) im Block-Buffer von Python und wird oft erst beim
+  # Prozessende auf die Platte geschrieben - dadurch tauchten diese Zeilen im
+  # log NACH "Eval complete. Exiting..." auf, obwohl sie zeitlich ganz am
+  # Anfang liefen (sah aus wie ein zweiter/aufgehängter Lauf, war es aber
+  # nicht). logging.info() (wie der Rest der absl-Logs im File) flusht
+  # zuverlässig sofort -> Reihenfolge im Log entspricht dann der echten
+  # Ausführungsreihenfolge.
+  logging.info('START MAIN')
+  logging.info('MODEL DIR (model_dir): %s', FLAGS.model_dir)
+  logging.info('MODEL DIR (data_dir): %s', FLAGS.data_dir)
+  logging.info('FLAGS.checkpoint = %s', FLAGS.checkpoint)
+  logging.info('FLAGS.train_mode = %s', FLAGS.train_mode)
 
   if len(argv) > 1:
     raise app.UsageError('Too many command-line arguments.')
@@ -495,29 +601,17 @@ def main(argv):
   '''
 
   
-  num_train_examples = data_loader.get_dataset_size(FLAGS.csv_path)
-  # no builder needed here anymore, now done later during input pipeline in custom_data.py (/dataset_loader)
-  """  image_paths = tf.io.gfile.glob(
-    FLAGS.data_dir + '/*.png'
-  ) """
-  
-  print("length image paths: ", num_train_examples)
   num_classes = 6
   num_eval_examples = 0
 
-
-  train_steps = model_lib.get_train_steps(num_train_examples)
-  eval_steps = FLAGS.eval_steps or int(
-      math.ceil(num_eval_examples / FLAGS.eval_batch_size))
-  epoch_steps = int(round(num_train_examples / FLAGS.train_batch_size))
-
-  logging.info('# train examples: %d', num_train_examples)
-  logging.info('# train_steps: %d', train_steps)
-  logging.info('# eval examples: %d', num_eval_examples)
-  logging.info('# eval steps: %d', eval_steps)
-
-  checkpoint_steps = (
-      FLAGS.checkpoint_steps or (FLAGS.checkpoint_epochs * epoch_steps))
+  # Eigene Änderung: Trainings-CSV-Einlesen + train_steps/epoch_steps/
+  # checkpoint_steps wurden hier vorher UNCONDITIONAL berechnet, also auch
+  # bei --mode=eval. Dadurch hätte man für reines Testen trotzdem ein
+  # gültiges --csv_path (Trainings-CSV) angeben müssen, obwohl --mode=eval
+  # nur das separate --test_csv_path braucht. Diese Werte werden aber
+  # ausschließlich vom Trainingsloop gebraucht (steps_per_loop =
+  # checkpoint_steps weiter unten) -> jetzt nur noch dort berechnet, siehe
+  # direkt nach "summary_writer = ..." im "else"-Zweig unten.
 
   topology = None
   if FLAGS.use_tpu:
@@ -543,8 +637,10 @@ def main(argv):
     model = model_lib.Model(num_classes)
 
   if FLAGS.mode == 'eval':
-    raise NotImplementedError("Custom eval pipeline not implemented yet.")
+    # ORIGINAL SimCLR (TFDS-Checkpoint-Polling-Schleife, hier nie fertig
+    # angepasst -> raise NotImplementedError) - auskommentiert:
     '''
+    raise NotImplementedError("Custom eval pipeline not implemented yet.")
     for ckpt in tf.train.checkpoints_iterator(
         FLAGS.model_dir, min_interval_secs=15):
       result = perform_evaluation(model, builder, eval_steps, ckpt, strategy,
@@ -553,8 +649,60 @@ def main(argv):
         logging.info('Eval complete. Exiting...')
         return
     '''
+
+    # Eigene Änderung: einmaliges Auswerten eines bereits trainierten
+    # Checkpoints (FLAGS.model_dir, ggf. Fallback auf FLAGS.checkpoint) auf
+    # dem separaten Testset FLAGS.test_csv_path. learning_rate/optimizer
+    # werden hier nur gebraucht, damit try_restore_from_checkpoint() ein
+    # Checkpoint-Objekt mit der gleichen Struktur wie beim Training bauen
+    # kann (siehe gleiche Logik weiter unten im "else"-Zweig) - die
+    # konkreten Werte spielen für die reine Inferenz keine Rolle.
+    with strategy.scope():
+      # Eigene Änderung: num_train_examples gibt es im eval-Zweig nicht mehr
+      # (siehe Kommentar oben - wird nicht mehr unconditional berechnet).
+      # WarmUpAndCosineDecay.__call__ (also die tatsächliche Nutzung von
+      # num_examples) wird beim reinen Auswerten NIE aufgerufen, weil nie
+      # optimizer.apply_gradients() läuft - der Wert ist hier nur Mittel zum
+      # Zweck, damit build_optimizer() ein Optimizer-Objekt mit der "richtigen
+      # Form" für try_restore_from_checkpoint() liefert. Ein Platzhalterwert
+      # (1) ist daher unbedenklich.
+      learning_rate = model_lib.WarmUpAndCosineDecay(FLAGS.learning_rate, 1)
+      optimizer = model_lib.build_optimizer(learning_rate)
+      dummy = tf.zeros([1, FLAGS.image_size, FLAGS.image_size, 3])
+      model(dummy, training=False)
+      try_restore_from_checkpoint(model, optimizer.iterations, optimizer)
+
+    perform_evaluation(model, strategy, topology)
+    logging.info('Eval complete. Exiting...')
+    return
   else:
     summary_writer = tf.summary.create_file_writer(FLAGS.model_dir)
+
+    # Eigene Änderung: hierher verschoben aus dem Bereich vor der
+    # mode-Verzweigung (siehe Kommentar dort) - wird nur für den
+    # Trainingsloop gebraucht, nicht für --mode=eval.
+    num_train_examples = data_loader.get_dataset_size(FLAGS.csv_path)
+    # no builder needed here anymore, now done later during input pipeline in custom_data.py (/dataset_loader)
+    """  image_paths = tf.io.gfile.glob(
+      FLAGS.data_dir + '/*.png'
+    ) """
+
+    # Eigene Änderung: print() -> logging.info() (Buffering, siehe Kommentar
+    # oben in main()).
+    logging.info('length image paths: %d', num_train_examples)
+
+    train_steps = model_lib.get_train_steps(num_train_examples)
+    eval_steps = FLAGS.eval_steps or int(
+        math.ceil(num_eval_examples / FLAGS.eval_batch_size))
+    epoch_steps = int(round(num_train_examples / FLAGS.train_batch_size))
+
+    logging.info('# train examples: %d', num_train_examples)
+    logging.info('# train_steps: %d', train_steps)
+    logging.info('# eval examples: %d', num_eval_examples)
+    logging.info('# eval steps: %d', eval_steps)
+
+    checkpoint_steps = (
+        FLAGS.checkpoint_steps or (FLAGS.checkpoint_epochs * epoch_steps))
 
     with strategy.scope():
       # Build input pipeline.
@@ -601,9 +749,11 @@ def main(argv):
       dummy = tf.zeros([1, FLAGS.image_size, FLAGS.image_size, 3])
       model(dummy, training=False)
 
-      print("MODEL BUILT")
+      # Eigene Änderung: print() -> logging.info() (Buffering, siehe
+      # Kommentar oben in main()).
+      logging.info('MODEL BUILT')
       for v in model.trainable_variables:
-          print(v.name, v.shape)
+          logging.info('%s %s', v.name, v.shape)
 
       # Restore checkpoint if available.
       checkpoint_manager = try_restore_from_checkpoint(
@@ -714,7 +864,9 @@ def main(argv):
       global_step = optimizer.iterations
       cur_step = global_step.numpy()
       iterator = iter(ds)
-      print("START TRAIN LOOP")
+      # Eigene Änderung: print() -> logging.info() (Buffering, siehe
+      # Kommentar oben in main()).
+      logging.info('START TRAIN LOOP')
       while cur_step < train_steps:
         # Calls to tf.summary.xyz lookup the summary writer resource which is
         # set by the summary writer's context manager.
@@ -734,9 +886,11 @@ def main(argv):
       logging.info('Training complete...')
 
     if FLAGS.mode == 'train_then_eval':
-      perform_evaluation(model, builder, eval_steps,
-                         checkpoint_manager.latest_checkpoint, strategy,
-                         topology)
+      # Eigene Änderung: 'builder' war hier nie definiert (TFDS-Überbleibsel)
+      # -> hätte einen NameError geworfen, sobald train_then_eval benutzt
+      # worden wäre. Das gerade trainierte Modell liegt bereits im Speicher,
+      # ein erneutes Laden des Checkpoints ist daher nicht nötig.
+      perform_evaluation(model, strategy, topology)
 
 
 if __name__ == '__main__':
