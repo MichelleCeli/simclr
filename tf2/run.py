@@ -24,6 +24,7 @@ from absl import flags
 from absl import logging
 import custom_data as data_lib
 import dataset_loader as data_loader
+import label_stats
 import metrics
 import model as model_lib
 import objective as obj_lib
@@ -499,6 +500,20 @@ def perform_evaluation(model, strategy, topology):
   logging.info('# test examples: %d', num_test_examples)
   logging.info('# test steps: %d', test_steps)
 
+  # Eigene Änderung (Label-Normalisierung, siehe label_stats.py): das Modell
+  # wurde mit normalisierten Targets trainiert, sagt also Werte in
+  # normalisierter Skala vorher. Für menschlich interpretierbare MAE/MSE
+  # (z.B. Grad) muss der Output zurückskaliert werden, bevor er mit den
+  # (raw) Test-Labels verglichen wird. Stats kommen aus <model_dir>/
+  # label_stats.json, NICHT aus FLAGS.csv_path - --mode=eval braucht
+  # bewusst keine Trainings-CSV (siehe Kommentar oben in main()).
+  # load_label_stats_or_default() fällt auf mean=0/std=1 (No-Op) zurück,
+  # falls der Checkpoint noch aus der Zeit vor dieser Änderung stammt.
+  label_mean, label_std = label_stats.load_label_stats_or_default(
+      os.path.join(FLAGS.model_dir, 'label_stats.json'))
+  label_mean_tf = tf.constant(label_mean, dtype=tf.float32)
+  label_std_tf = tf.constant(label_std, dtype=tf.float32)
+
   # Build input pipeline. is_training=False -> kein repeat(-1), kein shuffle,
   # drop_remainder=False -> der gesamte Testdatensatz wird genau einmal
   # durchlaufen.
@@ -516,8 +531,11 @@ def perform_evaluation(model, strategy, topology):
     assert outputs is not None, (
         '--train_mode=finetune muss gesetzt sein, damit model(...) den '
         'supervised head zurückgibt.')
-    mae_metric.update_state(tf.reduce_mean(tf.abs(labels - outputs)))
-    mse_metric.update_state(tf.reduce_mean(tf.square(labels - outputs)))
+    # Eigene Änderung: Output zurückskalieren (siehe Kommentar oben) bevor
+    # gegen die raw Test-Labels verglichen wird.
+    outputs_denorm = outputs * label_std_tf + label_mean_tf
+    mae_metric.update_state(tf.reduce_mean(tf.abs(labels - outputs_denorm)))
+    mse_metric.update_state(tf.reduce_mean(tf.square(labels - outputs_denorm)))
 
   with strategy.scope():
 
@@ -704,6 +722,19 @@ def main(argv):
     checkpoint_steps = (
         FLAGS.checkpoint_steps or (FLAGS.checkpoint_epochs * epoch_steps))
 
+    # Eigene Änderung: Label-Normalisierung (Schritt 1, Task
+    # "Label-Normalisierung einbauen"). Mean/Std NUR aus der Trainings-CSV
+    # (FLAGS.csv_path) berechnen und zusammen mit dem Checkpoint speichern
+    # (siehe label_stats.py für die ausführliche Begründung). Wird unten in
+    # single_step() benutzt, um den Loss zu normalisieren und die
+    # MAE/MSE-Metriken wieder zurückzuskalieren.
+    label_mean, label_std = label_stats.compute_label_stats(FLAGS.csv_path)
+    label_stats.save_label_stats(
+        label_mean, label_std,
+        os.path.join(FLAGS.model_dir, 'label_stats.json'))
+    label_mean_tf = tf.constant(label_mean, dtype=tf.float32)
+    label_std_tf = tf.constant(label_std, dtype=tf.float32)
+
     with strategy.scope():
       # Build input pipeline.
 
@@ -812,14 +843,32 @@ def main(argv):
             l = tf.concat([l, l], 0)
           tf.print("labels:", labels['labels'][0])
           tf.print("outputs:", outputs[0])
-          sup_loss = obj_lib.add_supervised_loss(labels=l, predictions=outputs)
+          # Eigene Änderung (Label-Normalisierung, siehe label_stats.py):
+          # Loss wird auf NORMALISIERTEN Labels berechnet, damit der Gradient
+          # nicht von der Zieldimension mit dem größten Wertebereich
+          # dominiert wird. label_mean_tf/label_std_tf kommen aus dem Block
+          # weiter oben (vor "with strategy.scope(): # Build input pipeline").
+          l_norm = (l - label_mean_tf) / label_std_tf
+          sup_loss = obj_lib.add_supervised_loss(labels=l_norm, predictions=outputs)
           if loss is None:
             loss = sup_loss
           else:
             loss += sup_loss
+          # Eigene Änderung: für die MAE/MSE-Metrik (soll in den
+          # ursprünglichen Einheiten interpretierbar bleiben, z.B. Grad) den
+          # Modell-Output zurückskalieren, statt im normalisierten Raum mit
+          # den (raw) Labels `l` zu vergleichen.
+          outputs_denorm = outputs * label_std_tf + label_mean_tf
+          # Eigene Änderung: zusätzlicher Print, da "outputs" oben jetzt in
+          # normalisierter Skala ist (Modell lernt l_norm vorherzusagen) und
+          # daher nicht mehr direkt mit "labels" (raw) vergleichbar ist.
+          # outputs_denorm ist in derselben Skala wie labels -> direkt
+          # vergleichbar.
+          tf.print("outputs_denorm (raw, vergleichbar mit labels):",
+                    outputs_denorm[0])
           metrics.update_finetune_metrics_train(supervised_loss_metric,
                                                 supervised_acc_metric, sup_loss,
-                                                l, outputs)
+                                                l, outputs_denorm)
         weight_decay = model_lib.add_weight_decay(
             model, adjust_per_optimizer=True)
         weight_decay_metric.update_state(weight_decay)
